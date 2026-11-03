@@ -78,6 +78,7 @@ class CompletionRequest(OpenAIBaseModel):
     top_k: int | None = None
     min_p: float | None = None
     repetition_penalty: float | None = None
+    elastic_phase: Literal["small", "big", "auto"] | None = None
     watermarking: bool | None = None
     length_penalty: float = 1.0
     stop_token_ids: list[int] | None = []
@@ -397,7 +398,9 @@ class CompletionRequest(OpenAIBaseModel):
                 "skip_special_tokens", True
             )
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        if self.elastic_phase is not None:
+            extra_args["elastic_phase"] = self.elastic_phase
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
