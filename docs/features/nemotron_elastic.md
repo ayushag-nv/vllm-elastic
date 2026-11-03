@@ -57,6 +57,8 @@ curl http://localhost:8000/v1/chat/completions \
 `elastic_phase` also works on `/v1/completions`. For the Python `LLM` API, use
 `SamplingParams(extra_args={"elastic_phase": "small"})`. Omitting the setting means
 `auto`. Invalid values, or using the setting on a non-Elastic model, are rejected.
+Beam search and resumable input sessions are not supported. Streaming responses
+are supported.
 
 ## What is shared
 
@@ -71,6 +73,8 @@ width inference: the reused state is **not numerically equivalent** to recomputi
 that prefix entirely at the destination width. Validate answer quality on your
 workload. Use `--no-enable-prefix-caching` to disable reuse between requests; the
 state within an `auto` request is still shared across its width change.
+After preemption, recomputation follows the request's original width transition:
+the prefix before the generated marker runs small, and the remainder runs big.
 
 The implementation currently requires Model Runner V2, synchronous scheduling,
 Triton MoE, and one GPU. Tensor/pipeline/data parallelism, quantization, LoRA,
@@ -79,16 +83,25 @@ A full-weight checkpoint must fit even when every request chooses the small widt
 
 ## Verify the implementation
 
-Run the CPU tests with `pytest tests/v1/core/test_elastic.py`. The GPU regression
-test needs the real checkpoint and a dedicated GPU with at least 80 GiB:
+Run the CPU tests with `pytest tests/v1/core/test_elastic.py`. The small GPU test
+creates a tiny hybrid checkpoint and compares logits with separately materialized
+Transformers models. It covers both widths, the transition, prompt embeddings
+and recovery after preemption, in eager mode and with decode graphs:
+
+```bash
+pytest tests/models/language/generation/test_nemotron_elastic.py -k logits_and_recovery -v
+```
+
+The serving smoke test needs the real checkpoint and a dedicated GPU with at
+least 80 GiB:
 
 ```bash
 ELASTIC_TEST_MODEL=/path/to/elastic-checkpoint \
 VLLM_GPU_SYNC_CHECK=error \
-pytest tests/models/language/generation/test_nemotron_elastic.py -v
+pytest tests/models/language/generation/test_nemotron_elastic.py -k switching_and_shared_cache -v
 ```
 
 It checks the generated-marker transition, fixed modes, concurrent requests and
-cache reuse in eager mode and with decode graphs. The GPU test is run manually;
-it is not added to the shared model CI jobs. These checks establish serving
-behavior, not task-level quality or a throughput improvement.
+cache reuse in eager mode and with decode graphs. The tiny-checkpoint test runs
+in hybrid-model CI; the real-checkpoint smoke test is manual. These checks do not
+establish task-level quality or a throughput improvement.

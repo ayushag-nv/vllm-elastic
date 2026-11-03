@@ -326,6 +326,8 @@ class CompletionRequest(OpenAIBaseModel):
         max_tokens: int,
         default_sampling_params: dict | None = None,
     ) -> BeamSearchParams:
+        if self.elastic_phase is not None:
+            raise ValueError("Beam search is not supported for Elastic models")
         if default_sampling_params is None:
             default_sampling_params = {}
         n = self.n if self.n is not None else 1

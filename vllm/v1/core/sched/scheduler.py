@@ -701,13 +701,14 @@ class Scheduler(SchedulerInterface):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         if self.elastic is not None:
-            eligible = list(self.running)
+            eligible: Iterable[Request] = self.running
             if (
                 len(self.running) + self.num_waiting_for_streaming_input
                 < self.max_num_active_reqs
             ):
-                eligible.extend(self.kv_holding_waiting)
-                eligible.extend(self.waiting)
+                eligible = itertools.chain(
+                    eligible, self.kv_holding_waiting, self.waiting
+                )
             self.elastic_phase = self.elastic.select_phase(eligible, self.elastic_phase)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -877,6 +878,10 @@ class Scheduler(SchedulerInterface):
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
+                )
+            if self.elastic is not None:
+                num_new_tokens = self.elastic.limit_tokens(
+                    request, request.num_computed_tokens, num_new_tokens
                 )
 
             # Schedule encoder inputs.
@@ -1295,6 +1300,14 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
+                if self.elastic is not None:
+                    # A cache hit may skip the small part of a resumed request.
+                    # Remember it for phase selection, but recheck on admission.
+                    request.elastic_cache_hit_tokens = num_computed_tokens
+                    if self.elastic.request_phase(request) != self.elastic_phase:
+                        skip_request(request_queue)
+                        continue
+
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 duplicate_encoder_inputs = []
@@ -1391,6 +1404,11 @@ class Scheduler(SchedulerInterface):
                             # so drop the padding instead of shortening it.
                             num_new_tokens = 1
                             pad_spec_decode = False
+
+                    if self.elastic is not None:
+                        num_new_tokens = self.elastic.limit_tokens(
+                            request, num_computed_tokens, num_new_tokens
+                        )
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -1844,6 +1862,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.elastic_cache_hit_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2782,6 +2801,12 @@ class Scheduler(SchedulerInterface):
         # to return empty token ids for the request.
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):
+            if (
+                self.elastic is not None
+                and request.elastic_transition_position is None
+                and output_token_id == self.elastic.think_end_token_id
+            ):
+                request.elastic_transition_position = request.num_tokens
             request.append_output_token_ids(output_token_id)
 
             # Check for stop and update request state.

@@ -146,14 +146,12 @@ class NemotronHElasticModel(NemotronHModel):
             else self.elastic.hidden_size
         )
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().embed_input_ids(input_ids)[..., : self.hidden_size].contiguous()
-
     def forward(
         self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
     ):
-        if inputs_embeds is not None:
-            inputs_embeds = inputs_embeds[..., : self.hidden_size].contiguous()
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_input_ids(input_ids)
+        inputs_embeds = inputs_embeds[..., : self.hidden_size].contiguous()
         hidden = super().forward(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )

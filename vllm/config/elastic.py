@@ -88,13 +88,28 @@ class ElasticConfig:
         params = request.sampling_params
         phase = elastic_phase(params.extra_args if params else None)
         if phase == "auto":
+            transition = request.elastic_transition_position
+            position = request.num_computed_tokens or request.elastic_cache_hit_tokens
             return (
-                "big"
-                if self.think_end_token_id in request.output_token_ids
-                else "small"
+                "big" if transition is not None and position >= transition else "small"
             )
         return phase
 
+    def limit_tokens(self, request: "Request", start: int, count: int) -> int:
+        transition = request.elastic_transition_position
+        params = request.sampling_params
+        if (
+            elastic_phase(params.extra_args if params else None) == "auto"
+            and transition is not None
+            and start < transition
+        ):
+            return min(count, transition - start)
+        return count
+
     def select_phase(self, requests: Iterable["Request"], previous: str | None) -> str:
-        phases = dict.fromkeys(self.request_phase(r) for r in requests)
-        return next((p for p in phases if p != previous), next(iter(phases), "big"))
+        phase = "big"
+        for request in requests:
+            phase = self.request_phase(request)
+            if phase != previous:
+                break
+        return phase

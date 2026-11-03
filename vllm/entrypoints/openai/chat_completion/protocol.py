@@ -718,6 +718,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_beam_search_params(
         self, max_tokens: int, default_sampling_params: dict
     ) -> BeamSearchParams:
+        if self.elastic_phase is not None:
+            raise ValueError("Beam search is not supported for Elastic models")
         n = self.n if self.n is not None else 1
         if (temperature := self.temperature) is None:
             temperature = default_sampling_params.get(
