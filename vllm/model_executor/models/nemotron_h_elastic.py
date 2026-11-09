@@ -8,12 +8,17 @@ from torch.nn import functional as F
 
 from vllm import ir
 from vllm.config import VllmConfig
-from vllm.config.elastic import ElasticConfig
+from vllm.config.elastic import ElasticConfig, SliceConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
     fused_grouped_topk,
 )
+from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.models.nemotron_h import (
     NemotronHAttention,
     NemotronHMLP,
@@ -21,6 +26,11 @@ from vllm.model_executor.models.nemotron_h import (
     NemotronHMoE,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
+
+
+def _local_prefix_size(prefix_size: int, partition_size: int, tp_rank: int) -> int:
+    """Intersect a global prefix with an existing contiguous TP shard."""
+    return max(0, min(partition_size, prefix_size - tp_rank * partition_size))
 
 
 class ElasticLinear(nn.Module):
@@ -33,17 +43,28 @@ class ElasticLinear(nn.Module):
         # Do not register the parent model as a child module.
         object.__setattr__(self, "state", state)
         self.output = output
+        is_row_parallel = isinstance(layer, RowParallelLinear)
+        self.reduce_results = (
+            is_row_parallel and layer.reduce_results and layer.tp_size > 1
+        )
+        self.skip_bias_add = layer.skip_bias_add
+        self.add_bias = not layer.skip_bias_add and (
+            not is_row_parallel or layer.tp_rank == 0
+        )
 
     def load_weights(self, weights):
         if hasattr(self.linear, "load_weights"):
             return self.linear.load_weights(weights)
         return AutoWeightsLoader(self.linear).load_weights(weights)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         width = self.state.hidden_size if self.output else self.weight.shape[0]
         weight = self.weight[:width, : x.shape[-1]]
         bias = self.bias[:width] if self.bias is not None else None
-        return F.linear(x, weight, bias), None
+        output = F.linear(x, weight, bias if self.add_bias else None)
+        if self.reduce_results:
+            output = tensor_model_parallel_all_reduce(output)
+        return output, bias if self.skip_bias_add else None
 
 
 class ElasticNorm(nn.Module):
@@ -65,37 +86,52 @@ class ElasticMoE(nn.Module):
         self.gate = layer.gate
         self.experts = layer.experts
         self.shared_experts = layer.shared_experts
+        self.tp_size = layer.tp_size
+        # Keep the checkpoint's global prefix; slicing each shard to the same
+        # width would select different neurons as TP changes.
+        self.intermediate_size = _local_prefix_size(
+            state.elastic.profiles["sliced"].moe_intermediate_size,
+            state.config.moe_intermediate_size // self.tp_size,
+            get_tensor_model_parallel_rank(),
+        )
         object.__setattr__(self, "state", state)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         config = self.state.config
-        hidden = self.state.hidden_size
-        logits = F.linear(x.float(), self.gate.weight[:, :hidden].float())
-        if self.state.phase == "big":
+        profile = self.state.profile
+        hidden = profile.hidden_size
+        if profile == self.state.elastic.profiles["full"]:
+            logits = F.linear(x.float(), self.gate.weight[:, :hidden].float())
             return self.experts(hidden_states=x, router_logits=logits)
-        weights, indices = fused_grouped_topk(
-            x,
-            logits,
-            config.num_experts_per_tok,
-            config.norm_topk_prob,
-            self.gate.e_score_correction_bias,
-            config.n_group,
-            config.topk_group,
-            scoring_func="sigmoid",
-        )
-        intermediate = self.state.elastic.small_intermediate_size
+        intermediate = self.intermediate_size
         experts = self.experts.routed_experts
-        output = fused_experts(
-            x.contiguous(),
-            experts.w13_weight[:, :intermediate, :hidden],
-            experts.w2_weight[:, :hidden, :intermediate],
-            weights,
-            indices,
-            activation=MoEActivation.from_str(config.mlp_hidden_act).without_mul(),
-        )
-        output = output * config.routed_scaling_factor
+        if intermediate:
+            logits = F.linear(x.float(), self.gate.weight[:, :hidden].float())
+            weights, indices = fused_grouped_topk(
+                x,
+                logits,
+                config.num_experts_per_tok,
+                config.norm_topk_prob,
+                self.gate.e_score_correction_bias,
+                config.n_group,
+                config.topk_group,
+                scoring_func="sigmoid",
+            )
+            output = fused_experts(
+                x.contiguous(),
+                experts.w13_weight[:, :intermediate, :hidden],
+                experts.w2_weight[:, :hidden, :intermediate],
+                weights,
+                indices,
+                activation=MoEActivation.from_str(config.mlp_hidden_act).without_mul(),
+            )
+            output = output * config.routed_scaling_factor
+        else:
+            output = torch.zeros_like(x)
         if self.shared_experts is not None:
             output = output + self.shared_experts(x)
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
         return output
 
 
@@ -105,7 +141,7 @@ class NemotronHElasticModel(NemotronHModel):
         assert elastic is not None
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.elastic = elastic
-        self.phase = "big"
+        self.phase = "full"
         for layer in self.layers:
             layer.norm = ElasticNorm(layer.norm)
             mixer = layer.mixer
@@ -139,12 +175,12 @@ class NemotronHElasticModel(NemotronHModel):
         mlp.down_proj = ElasticLinear(mlp.down_proj, self, True)
 
     @property
+    def profile(self) -> SliceConfig:
+        return self.elastic.profiles[self.phase]
+
+    @property
     def hidden_size(self) -> int:
-        return (
-            self.elastic.small_hidden_size
-            if self.phase == "small"
-            else self.elastic.hidden_size
-        )
+        return self.profile.hidden_size
 
     def forward(
         self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
@@ -156,4 +192,6 @@ class NemotronHElasticModel(NemotronHModel):
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
         # The runner and logits head keep a fixed output width across both graphs.
-        return F.pad(hidden, (0, self.elastic.hidden_size - self.hidden_size))
+        if self.hidden_size == self.config.hidden_size:
+            return hidden
+        return F.pad(hidden, (0, self.config.hidden_size - self.hidden_size))

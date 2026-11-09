@@ -879,11 +879,6 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
-            if self.elastic is not None:
-                num_new_tokens = self.elastic.limit_tokens(
-                    request, request.num_computed_tokens, num_new_tokens
-                )
-
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -1300,14 +1295,6 @@ class Scheduler(SchedulerInterface):
                         skip_request(request_queue)
                         continue
 
-                if self.elastic is not None:
-                    # A cache hit may skip the small part of a resumed request.
-                    # Remember it for phase selection, but recheck on admission.
-                    request.elastic_cache_hit_tokens = num_computed_tokens
-                    if self.elastic.request_phase(request) != self.elastic_phase:
-                        skip_request(request_queue)
-                        continue
-
                 encoder_inputs_to_schedule = None
                 external_load_encoder_input = []
                 duplicate_encoder_inputs = []
@@ -1404,11 +1391,6 @@ class Scheduler(SchedulerInterface):
                             # so drop the padding instead of shortening it.
                             num_new_tokens = 1
                             pad_spec_decode = False
-
-                    if self.elastic is not None:
-                        num_new_tokens = self.elastic.limit_tokens(
-                            request, num_computed_tokens, num_new_tokens
-                        )
 
                     # Schedule encoder inputs.
                     if request.has_encoder_inputs:
@@ -1862,7 +1844,6 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
-        request.elastic_cache_hit_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are

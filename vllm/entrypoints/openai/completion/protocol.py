@@ -78,7 +78,7 @@ class CompletionRequest(OpenAIBaseModel):
     top_k: int | None = None
     min_p: float | None = None
     repetition_penalty: float | None = None
-    elastic_phase: Literal["small", "big", "auto"] | None = None
+    elastic_phase: Literal["full", "sliced", "auto"] | None = None
     watermarking: bool | None = None
     length_penalty: float = 1.0
     stop_token_ids: list[int] | None = []

@@ -26,6 +26,7 @@ from vllm.compilation.cudagraph_pool import (
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.elastic import ElasticConfig
 from vllm.distributed.parallel_state import (
     get_pp_group,
     graph_capture,
@@ -160,16 +161,9 @@ class CudaGraphManager:
         ubatch_runner: "UBatchRunner | None" = None,
     ):
         self.vllm_config = vllm_config
-        self.elastic_phase = (
-            "big"
-            if getattr(
-                getattr(vllm_config.model_config, "hf_config", None),
-                "elastic_use_lazy_slicing",
-                False,
-            )
-            is True
-            else None
-        )
+        elastic = ElasticConfig.from_vllm_config(vllm_config)
+        self.elastic_profiles = tuple(elastic.profiles) if elastic is not None else ()
+        self.elastic_phase = next(iter(self.elastic_profiles), None)
         self.device = device
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.compilation_config = vllm_config.compilation_config
@@ -392,7 +386,7 @@ class CudaGraphManager:
                 descs_by_mode[mode] = [
                     replace(desc, elastic_phase=phase)
                     for desc in descs
-                    for phase in ("big", "small")
+                    for phase in self.elastic_profiles
                 ]
 
         for mode, descs in descs_by_mode.items():
