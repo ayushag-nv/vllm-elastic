@@ -9,6 +9,7 @@ from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
+from vllm.config.elastic import ElasticConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
@@ -95,6 +96,8 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self.elastic = ElasticConfig.from_vllm_config(vllm_config)
+        self.elastic_phase: str | None = None
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -697,6 +700,16 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        if self.elastic is not None:
+            eligible: Iterable[Request] = self.running
+            if (
+                len(self.running) + self.num_waiting_for_streaming_input
+                < self.max_num_active_reqs
+            ):
+                eligible = itertools.chain(
+                    eligible, self.kv_holding_waiting, self.waiting
+                )
+            self.elastic_phase = self.elastic.select_phase(eligible, self.elastic_phase)
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -793,6 +806,12 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+            if (
+                self.elastic is not None
+                and self.elastic.request_phase(request) != self.elastic_phase
+            ):
+                req_index += 1
+                continue
             if input_budget <= draft_slots:
                 break
 
@@ -860,7 +879,6 @@ class Scheduler(SchedulerInterface):
                 num_new_tokens = self._mamba_block_aligned_split(
                     request, num_new_tokens
                 )
-
             # Schedule encoder inputs.
             encoder_inputs_to_schedule = None
             external_load_encoder_input: list[int] = []
@@ -1073,6 +1091,12 @@ class Scheduler(SchedulerInterface):
                     break
 
                 request = request_queue.peek_request()
+                if (
+                    self.elastic is not None
+                    and self.elastic.request_phase(request) != self.elastic_phase
+                ):
+                    skip_request(request_queue)
+                    continue
                 request_id = request.request_id
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
@@ -1722,6 +1746,7 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            elastic_phase=self.elastic_phase,
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -2757,6 +2782,12 @@ class Scheduler(SchedulerInterface):
         # to return empty token ids for the request.
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):
+            if (
+                self.elastic is not None
+                and request.elastic_transition_position is None
+                and output_token_id == self.elastic.think_end_token_id
+            ):
+                request.elastic_transition_position = request.num_tokens
             request.append_output_token_ids(output_token_id)
 
             # Check for stop and update request state.

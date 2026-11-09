@@ -26,6 +26,7 @@ from vllm.compilation.cudagraph_pool import (
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.elastic import ElasticConfig
 from vllm.distributed.parallel_state import (
     get_pp_group,
     graph_capture,
@@ -83,6 +84,7 @@ class BatchExecutionDescriptor:
     num_active_loras: int = 0
     # Number of microbatches the batch is split into (DBO). 1 means no splitting.
     num_ubatches: int = 1
+    elastic_phase: str | None = None
 
 
 def make_cudagraph_stats(
@@ -159,6 +161,9 @@ class CudaGraphManager:
         ubatch_runner: "UBatchRunner | None" = None,
     ):
         self.vllm_config = vllm_config
+        elastic = ElasticConfig.from_vllm_config(vllm_config)
+        self.elastic_profiles = tuple(elastic.profiles) if elastic is not None else ()
+        self.elastic_phase = next(iter(self.elastic_profiles), None)
         self.device = device
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.compilation_config = vllm_config.compilation_config
@@ -376,6 +381,14 @@ class CudaGraphManager:
                 if ubatch_desc is not None:
                     descs_by_mode[mixed_mode].append(ubatch_desc)
 
+        if self.elastic_phase is not None:
+            for mode, descs in descs_by_mode.items():
+                descs_by_mode[mode] = [
+                    replace(desc, elastic_phase=phase)
+                    for desc in descs
+                    for phase in self.elastic_profiles
+                ]
+
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
@@ -540,6 +553,8 @@ class CudaGraphManager:
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:
+                if desc.elastic_phase != self.elastic_phase:
+                    continue
                 if _is_compatible(
                     desc,
                     num_reqs,
@@ -678,6 +693,8 @@ class ModelCudaGraphManager(CudaGraphManager):
         def create_forward_fn(
             desc: BatchExecutionDescriptor, warmup: bool
         ) -> Callable[[CUDAGraphMode], None]:
+            if desc.elastic_phase is not None:
+                model.set_elastic_phase(desc.elastic_phase)
             num_tokens = desc.num_tokens
             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
 
